@@ -6,29 +6,36 @@ import json
 import os
 import deepspeed
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Sequence
+from typing import List, Optional, Dict
 import logging
 
 import torch
 import transformers
-from torch.nn.utils.rnn import pad_sequence
+from liger_kernel.transformers.monkey_patch import _apply_liger_kernel
 import argparse
 from transformers import (
     AutoTokenizer,
+    AutoConfig,
     AutoModelForCausalLM,
     set_seed,
     Seq2SeqTrainer,
 )
 from datasets import load_dataset
+from datasets.combine import concatenate_datasets
 
 import deepspeed.comm as dist
 from deepspeed.linear import LoRAConfig, QuantizationConfig
+
+from axo_dataset import ShareGPTPrompterV2, SimpleShareGPTPromptTokenizingStrategy, TokenizedPromptDataset, add_get_turns_to_conversation, check_example_labels
+from unsloth_grad import hf_grad_checkpoint_unsloth_wrapper
+
+transformers.modeling_utils.checkpoint = hf_grad_checkpoint_unsloth_wrapper
 
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
-
+add_get_turns_to_conversation()
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
@@ -41,16 +48,9 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
     )
-    auth_token: Optional[str] = field(
-        default=None,
-        metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
-    )
 
 @dataclass
 class DataArguments:
-    eval_dataset_size: int = field(
-        default=1024, metadata={"help": "Size of validation dataset."}
-    )
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -58,38 +58,19 @@ class DataArguments:
             "value if set."
         },
     )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-            "value if set."
-        },
-    )
-    source_max_len: int = field(
-        default=1024,
-        metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    target_max_len: int = field(
-        default=256,
-        metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    dataset: str = field(
+    datasets: str = field(
         default='alpaca',
-        metadata={"help": "Which dataset to finetune on. See datamodule for options."}
+        metadata={"help": "Which datasets to finetune on. Comma separated."}
     )
-    dataset_format: Optional[str] = field(
-        default=None,
-        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
+    conversation_format: Optional[str] = field(
+        default="claude",
+        metadata={"help": "Which conversation format is used."}
     )
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     cache_dir: Optional[str] = field(
         default=None
-    )
-    train_on_source: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to train on the input in addition to the target text."}
     )
     mmlu_split: Optional[str] = field(
         default='eval',
@@ -153,6 +134,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
     remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
     max_grad_norm: float = field(default=1.0, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
+    max_sequence_len: float = field(default=8192, metadata={"help": 'Max sequence lenth for training. Increase if needed but longer sequences take more memory.'})
     gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
     activation_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
 
@@ -169,8 +151,11 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
 def get_accelerate_model(args):
     if args.full_finetune: assert args.bits in [16, 32]
 
+    model_config = AutoConfig.from_pretrained(args.model_name_or_path)
+    _apply_liger_kernel(model_config.model_type)
+    
+
     print(f'loading base model {args.model_name_or_path}...')
-    compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
 
     if not args.full_finetune:
         base_weight_shards = dist.get_world_size() if args.base_weight_sharding else 1
@@ -197,7 +182,6 @@ def get_accelerate_model(args):
         args.tokenizer_name_or_path,
         padding_side="right",
         use_fast=False, # Fast tokenizer giving issues.
-        token=args.auth_token
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id=tokenizer.eos_token_id
@@ -209,11 +193,11 @@ def get_accelerate_model(args):
             args.model_name_or_path,
             cache_dir=args.cache_dir,
             torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
-            #attn_implementation="flash_attention_2",
-            token=args.auth_token
+            attn_implementation="flash_attention_2",
         )
 
     print("created model")
+
     model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
@@ -238,197 +222,37 @@ def print_trainable_parameters(args, model):
         f"trainable: {100 * trainable_params / all_param}"
     )
 
-@dataclass
-class DataCollatorForCausalLM(object):
-    tokenizer: transformers.PreTrainedTokenizer
-    source_max_len: int
-    target_max_len: int
-    train_on_source: bool
-    predict_with_generate: bool
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        # Extract elements
-        sources = [f"{self.tokenizer.bos_token}{example['input']}" for example in instances]
-        targets = [f"{example['output']}{self.tokenizer.eos_token}" for example in instances]
-        # Tokenize
-        tokenized_sources_with_prompt = self.tokenizer(
-            sources,
-            max_length=self.source_max_len,
-            truncation=True,
-            add_special_tokens=False,
-            padding='max_length',
-        )
-        tokenized_targets = self.tokenizer(
-            targets,
-            max_length=self.target_max_len,
-            truncation=True,
-            add_special_tokens=False,
-            padding='max_length',
-        )
-        # Build the input and labels for causal LM
-        input_ids = []
-        labels = []
-        for tokenized_source, tokenized_target in zip(
-            tokenized_sources_with_prompt['input_ids'],
-            tokenized_targets['input_ids']
-        ):
-            if not self.predict_with_generate:
-                data = torch.tensor(tokenized_source + tokenized_target)
-                #if len(data) < 1280:
-                #    import pdb; pdb.set_trace()
-
-                input_ids.append(data)
-                if not self.train_on_source:
-                    labels.append(
-                        torch.tensor([IGNORE_INDEX for _ in range(len(tokenized_source))] + copy.deepcopy(tokenized_target))
-                    )
-                else:
-                    labels.append(torch.tensor(copy.deepcopy(tokenized_source + tokenized_target)))
-            else:
-                input_ids.append(torch.tensor(tokenized_source))
-        # Apply padding
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX) if not self.predict_with_generate else None
-        data_dict = {
-            'input_ids': input_ids,
-            'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
-        }
-        if labels is not None:
-            data_dict['labels'] = labels
-        return data_dict
-
-ALPACA_PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response: "
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response: "
-    ),
-}
-
-def extract_alpaca_dataset(example):
-    if example.get("input", "") != "":
-        prompt_format = ALPACA_PROMPT_DICT["prompt_input"]
-    else:
-        prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
-    return {'input': prompt_format.format(**example)}
-
-
-
-def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
+def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> List[Dict]:
     """
-    Make dataset and collator for supervised fine-tuning.
-    Datasets are expected to have the following columns: { `input`, `output` }
-
-    Available datasets to be selected with `dataset` argument:
-        - alpaca, 52002 examples
-        - alpaca cleaned, 51942 examples
-        - chip2 (OIG), 210289 examples
-        - self-instruct, 82612 examples
-        - hh-rlhf (Anthropic), 160800 examples
-        - longform, 23.7k examples
-        - oasst1 (OpenAssistant) primary message tree only, 9,846 examples
-
-    Coming soon:
-        - unnatural instructions core, 66010 examples
-        - unnatural instructions full, 240670 examples
-        - alpaca-gpt4, 52002 examples
-        - unnatural-instructions-gpt4, 9000 examples
-        - supernatural-instructions, 69624 examples (same as paper with 100 ex/task more can be used)
-        - flan (FLAN v2), up to 20M examples available
-        - vicuna
-
+    Make dataset for supervised fine-tuning.
     """
-    def load_data(dataset_name):
-        if dataset_name == 'alpaca':
-            return load_dataset("tatsu-lab/alpaca")
-        elif dataset_name == 'alpaca-clean':
-            return load_dataset("yahma/alpaca-cleaned")
-        elif dataset_name == 'chip2':
-            return load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
-        elif dataset_name == 'self-instruct':
-            return load_dataset("yizhongw/self_instruct", name='self_instruct')
-        elif dataset_name == 'hh-rlhf':
-            return load_dataset("Anthropic/hh-rlhf")
-        elif dataset_name == 'longform':
-            return load_dataset("akoksal/LongForm")
-        elif dataset_name == 'oasst1':
-            return load_dataset("timdettmers/openassistant-guanaco")
-        elif dataset_name == 'vicuna':
-            raise NotImplementedError("Vicuna data was not released.")
-        else:
-            NotImplementedError("Add your dataset implementation here.")
+    def load_data(dataset_names: str):
+        return concatenate_datasets([load_dataset(dataset)["train"] for dataset in dataset_names.split(",")])
+    
+    dataset = load_data(args.datasets)
 
-    def format_dataset(dataset, dataset_format):
-        if (
-            dataset_format == 'alpaca' or dataset_format == 'alpaca-clean' or
-            (dataset_format is None and args.dataset in ['alpaca', 'alpaca-clean'])
-        ):
-            dataset = dataset.map(extract_alpaca_dataset, remove_columns=['instruction'])
-        elif dataset_format == 'chip2' or (dataset_format is None and args.dataset == 'chip2'):
-            dataset = dataset.map(lambda x: {
-                'input': x['text'].split('\n<bot>: ')[0].replace('<human>: ', ''),
-                'output': x['text'].split('\n<bot>: ')[1],
-            })
-        elif dataset_format == 'self-instruct' or (dataset_format is None and args.dataset == 'self-instruct'):
-            for old, new in [["prompt", "input"], ["completion", "output"]]:
-                dataset = dataset.rename_column(old, new)
-        elif dataset_format == 'hh-rlhf' or (dataset_format is None and args.dataset == 'hh-rlhf'):
-            dataset = dataset.map(lambda x: {
-                'input': '',
-                'output': x['chosen']
-            })
-        elif dataset_format == 'oasst1' or (dataset_format is None and args.dataset == 'oasst1'):
-            dataset = dataset.map(lambda x: {
-                'input': '',
-                'output': x['text'],
-            })
-        elif dataset_format == 'input-output':
-            # leave as is
-            pass
-        else:
-            dataset = dataset.map(lambda x: {
-                'input': x['prompt'],
-                'output': x['completion'],
-            })
-        # Remove unused columns.
-        dataset = dataset.remove_columns(
-            [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
-        )
-        return dataset
+    strategy = SimpleShareGPTPromptTokenizingStrategy(
+        ShareGPTPrompterV2(
+            conversation=args.conversation_format,
+            role_key_model=None,
+            role_key_human=None,
+        ),
+        tokenizer,
+        False,  # train_on_inputs
+        args.max_sequence_len,  # sequence_len
+    )
 
-    def apply_chat_template(prompt: str) -> str:
-        return tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False)
+    train_dataset = TokenizedPromptDataset(
+        strategy, dataset, process_count=1
+    )  
 
-    # Load dataset.
-    dataset = load_data(args.dataset)
-    dataset = format_dataset(dataset, args.dataset_format)
-    dataset = dataset.map(lambda example: {"input": apply_chat_template(example["input"])})
     print("!! sample values from the data !!")
-    print(list(dataset['train'].select(range(5))))
+    for example in train_dataset.select(range(5)):
+        print(check_example_labels(example, tokenizer, True))
 
-    if args.do_train:
-        train_dataset = dataset['train']
-        if args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
-            train_dataset = train_dataset.select(range(args.max_train_samples))
-        if args.group_by_length:
-            train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+    exit()
 
-    data_collator = DataCollatorForCausalLM(
-        tokenizer=tokenizer,
-        source_max_len=args.source_max_len,
-        target_max_len=args.target_max_len,
-        train_on_source=args.train_on_source,
-        predict_with_generate=args.predict_with_generate,
-    )
-    return dict(
-        train_dataset=train_dataset if args.do_train else None,
-        data_collator=data_collator
-    )
+    return train_dataset
 
 def train():
     dist.init_distributed()
@@ -450,13 +274,13 @@ def train():
     print('loaded model')
     set_seed(args.seed)
 
-    data_module = make_data_module(tokenizer=tokenizer, args=args)
+    train_dataset = make_data_module(tokenizer=tokenizer, args=args)
 
     trainer = Seq2SeqTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
+        train_dataset=train_dataset,
     )
     trainer.model.train()
 
@@ -464,18 +288,16 @@ def train():
 
     all_metrics = {"run_name": args.run_name}
     # Training
-    if args.do_train:
-        logger.info("*** Train ***")
-        train_result = trainer.train()
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-        all_metrics.update(metrics)
-   
-   
-        with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
-            fout.write(json.dumps(all_metrics))
+    logger.info("*** Train ***")
+    train_result = trainer.train()
+    metrics = train_result.metrics
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+    trainer.save_state()
+    all_metrics.update(metrics)
+
+    with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
+        fout.write(json.dumps(all_metrics))
 
 
 if __name__ == "__main__":
